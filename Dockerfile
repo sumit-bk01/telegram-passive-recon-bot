@@ -16,7 +16,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY bot.py .
 
+EXPOSE 1000
 # Non-root user (UID 1001 is the default in this image)
 USER 1001
+
+
 
 CMD ["python", "bot.py"]
