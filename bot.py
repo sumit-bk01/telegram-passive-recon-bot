@@ -207,8 +207,10 @@ def find_httpx():
 HTTPX = find_httpx()
 
 
-async def probe_live(hosts):
-    """Run httpx on the hostnames and return {url: status} for the ones answering 200 or 403."""
+async def probe_live(hosts, live):
+    """Run httpx on the hostnames and add {url: status} for the ones answering 200 or 403 to `live`
+    while httpx is still running. Returns True if httpx finished, False if it hit HTTPX_TIMEOUT
+    (then `live` holds the partial results found so far)."""
     # Hostnames were validated by keep_valid(); there is no shell and they go in through stdin.
     command = [HTTPX, "-silent", "-no-color", "-status-code", "-match-code", HTTPX_STATUS_CODES,
                "-timeout", "7", "-retries", "0", "-threads", "100", "-rate-limit", "300"]
@@ -218,21 +220,31 @@ async def probe_live(hosts):
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.DEVNULL,
     )
-    try:
-        output, _ = await asyncio.wait_for(process.communicate("\n".join(sorted(hosts)).encode()), HTTPX_TIMEOUT)
-    except asyncio.TimeoutError:
-        process.kill()
-        await process.wait()
-        raise
-    if process.returncode != 0:
-        raise RuntimeError(f"httpx exited with code {process.returncode}")
 
-    live = {}
-    for line in output.decode(errors="replace").splitlines():
-        match = HTTPX_LINE_RE.match(line.strip())
-        if match:
-            live[match.group(1)] = match.group(2)
-    return live
+    async def feed():
+        process.stdin.write("\n".join(sorted(hosts)).encode())
+        await process.stdin.drain()
+        process.stdin.close()
+
+    async def read():
+        async for raw in process.stdout:
+            match = HTTPX_LINE_RE.match(raw.decode(errors="replace").strip())
+            if match:
+                live[match.group(1)] = match.group(2)
+
+    finished = True
+    try:
+        await asyncio.wait_for(asyncio.gather(feed(), read()), HTTPX_TIMEOUT)
+        await process.wait()
+        if process.returncode != 0:
+            raise RuntimeError(f"httpx exited with code {process.returncode}")
+    except asyncio.TimeoutError:
+        finished = False
+    finally:
+        if process.returncode is None:
+            process.kill()
+            await process.wait()
+    return finished
 
 
 # ---------- Telegram commands ----------
@@ -366,14 +378,19 @@ async def check_live_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
             if not hosts:
                 await send(message.reply_text, f"{domain}: no subdomains found.")
                 return
+            await send(message.reply_text, f"Found {len(hosts)} subdomains. Checking which are live "
+                                           f"(can take several minutes) ...")
+        live = {}
         try:
-            live = await probe_live(hosts)
+            finished = await probe_live(hosts, live)
         except Exception as error:
             log.warning("httpx failed: %r", error)
             await send(message.reply_text, "The live check failed. Try again later.")
             return
 
     text = f"{label}: {len(live)} live (status {HTTPX_STATUS_CODES}) out of {len(hosts)} hosts\n"
+    if not finished:
+        text += f"Stopped after {HTTPX_TIMEOUT // 60} minutes. This is a partial result.\n"
     if failed:
         text += f"Not working right now: {', '.join(failed)}\n"
     text += "\n" + "\n".join(f"{url} [{code}]" for url, code in sorted(live.items()))
