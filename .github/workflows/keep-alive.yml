@@ -19,4 +19,4 @@ jobs:
           curl --fail --silent --show-error \
             --connect-timeout 10 \
             --max-time 150 \
-            "https://YOUR-RENDER-URL.onrender.com/"
+            "https://telegram-passive-recon-bot.onrender.com"
