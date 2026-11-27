@@ -212,7 +212,10 @@ async def probe_live(hosts, live):
     while httpx is still running. Returns True if httpx finished, False if it hit HTTPX_TIMEOUT
     (then `live` holds the partial results found so far)."""
     # Hostnames were validated by keep_valid(); there is no shell and they go in through stdin.
+    # -follow-redirects: google.com answers 301 -> www.google.com. Without it only the 301 is seen and the
+    # host is dropped, because the filter keeps only 200/403 (the status of the final page is used).
     command = [HTTPX, "-silent", "-no-color", "-status-code", "-match-code", HTTPX_STATUS_CODES,
+               "-follow-redirects", "-max-redirects", "5",
                "-timeout", "7", "-retries", "0", "-threads", "100", "-rate-limit", "300"]
     process = await asyncio.create_subprocess_exec(
         *command,
