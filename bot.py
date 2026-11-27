@@ -1,3 +1,9 @@
+"""Simple passive subdomain finder bot. Usage in Telegram: /subs example.com
+
+Passive only: it asks public websites (crt.sh etc.) and never contacts the target.
+Uses long polling. When the PORT variable is set (Render web service) it also serves a tiny /health page.
+"""
+
 import asyncio
 import html
 import json
@@ -5,507 +11,436 @@ import logging
 import os
 import re
 import shutil
+import subprocess
 import sys
+import threading
 import urllib.parse
 import urllib.request
-
-from aiohttp import web
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from telegram import Update
 from telegram.constants import ParseMode
 from telegram.error import NetworkError
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    ContextTypes
-)
-
-# ==========================================
-# CONFIGURATION
-# ==========================================
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-
 if not BOT_TOKEN:
-    sys.exit("ERROR: TELEGRAM_BOT_TOKEN is missing.")
+    sys.exit("Set the TELEGRAM_BOT_TOKEN environment variable (get one from @BotFather).")
 
-PORT = int(os.environ.get("PORT", 10000))
-
-MAX_REPLY_CHARS = 3500
-SUBFINDER_TIMEOUT = 150
-
-busy = asyncio.Semaphore(3)
-
-SUBFINDER = shutil.which("subfinder")
-
-SUBFINDER_PROVIDER_CONFIG = os.environ.get(
-    "SUBFINDER_PROVIDER_CONFIG"
-)
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s"
-)
-
-logging.getLogger("httpx").setLevel(logging.WARNING)
-
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logging.getLogger("httpx").setLevel(logging.WARNING)  # its logs would contain the bot token
 log = logging.getLogger("bot")
 
+DOMAIN_RE = re.compile(r"^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$")
+MAX_REPLY_CHARS = 3500
+MAX_UPLOAD_BYTES = 4 * 1024 * 1024  # uploaded host lists bigger than 4 MB are refused
+MAX_UPLOAD_HOSTS = 50000
+busy = asyncio.Semaphore(3)  # at most 3 searches at the same time
 
-# ==========================================
-# DOMAIN VALIDATION
-# ==========================================
-
-DOMAIN_RE = re.compile(
-    r"^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$"
-)
+# subfinder is used automatically if it is installed (https://github.com/projectdiscovery/subfinder).
+# It reads your API keys from its own config file, so no keys are needed in this code.
+INSTALL_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "install_subfinder.ps1")
 
 
-def keep_valid(names, domain):
-
-    found = set()
-
-    for name in names:
-
-        name = name.strip().lower().removeprefix("*.")
-
-        if (
-            DOMAIN_RE.fullmatch(name)
-            and (name == domain or name.endswith("." + domain))
-        ):
-            found.add(name)
-
+def find_subfinder():
+    """Look on PATH, then in the folder the install script uses (PATH of a running program is not refreshed)."""
+    found = shutil.which("subfinder")
+    if not found and os.name == "nt":
+        candidate = os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "subfinder", "subfinder.exe")
+        found = candidate if os.path.exists(candidate) else None
     return found
 
 
-# ==========================================
-# RENDER HEALTH CHECK
-# ==========================================
-
-async def health(request):
-
-    return web.json_response({
-        "status": "ok",
-        "service": "telegram-subdomain-bot"
-    })
-
-
-async def start_health_server(app):
-
-    health_app = web.Application()
-
-    health_app.router.add_get("/", health)
-    health_app.router.add_get("/health", health)
-
-    runner = web.AppRunner(health_app)
-
-    await runner.setup()
-
-    site = web.TCPSite(
-        runner,
-        "0.0.0.0",
-        PORT
-    )
-
-    await site.start()
-
-    app.bot_data["health_runner"] = runner
-
-    log.info("Health server running on 0.0.0.0:%s", PORT)
+def install_subfinder_if_missing():
+    """On Windows, run the PowerShell installer (it asks for administrator rights with a UAC prompt)."""
+    found = find_subfinder()
+    if found or os.name != "nt" or os.environ.get("AUTO_INSTALL_SUBFINDER") == "0":
+        return found
+    log.info("subfinder not found. Running install_subfinder.ps1 (accept the UAC prompt)...")
+    try:
+        subprocess.run(  # list of arguments, no shell
+            ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", INSTALL_SCRIPT],
+            check=False,
+            timeout=600,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        log.warning("Could not run the installer: %r", error)
+    return find_subfinder()
 
 
-async def post_init(app):
-
-    await start_health_server(app)
-
-
-async def post_shutdown(app):
-
-    runner = app.bot_data.get("health_runner")
-
-    if runner:
-        await runner.cleanup()
-
-    log.info("Health server stopped.")
+SUBFINDER = install_subfinder_if_missing()
+# Optional: use a provider config file from another place than subfinder's default.
+SUBFINDER_PROVIDER_CONFIG = os.environ.get("SUBFINDER_PROVIDER_CONFIG")
+SUBFINDER_TIMEOUT = 150  # seconds; it asks many providers, so it needs longer than one website
 
 
-# ==========================================
-# PASSIVE RECON SOURCES
-# ==========================================
+# ---------- sources: each one turns the website's reply into a list of names ----------
 
 def crtsh(text):
-
-    return [
-        name
-        for record in json.loads(text)
-        for name in record["name_value"].split("\n")
-    ]
+    return [n for r in json.loads(text) for n in r["name_value"].split("\n")]
 
 
 def certspotter(text):
-
-    return [
-        name
-        for record in json.loads(text)
-        for name in record["dns_names"]
-    ]
+    return [n for r in json.loads(text) for n in r["dns_names"]]
 
 
 def hackertarget(text):
-
-    return [
-        line.split(",")[0]
-        for line in text.splitlines()
-    ]
+    return [line.split(",")[0] for line in text.splitlines()]
 
 
 def urlscan(text):
-
-    return [
-        record["page"]["domain"]
-        for record in json.loads(text).get("results", [])
-        if record.get("page", {}).get("domain")
-    ]
+    return [r["page"]["domain"] for r in json.loads(text)["results"]]
 
 
 def wayback(text):
-
-    return [
-        urllib.parse.urlparse(row[0]).hostname or ""
-        for row in json.loads(text)[1:]
-        if row
-    ]
+    return [urllib.parse.urlparse(row[0]).hostname or "" for row in json.loads(text)[1:]]
 
 
+# name -> (url, parser). {d} is replaced by the (already validated) domain.
 SOURCES = {
-
-    "crt.sh": (
-        "https://crt.sh/?q=%25.{d}&output=json",
-        crtsh
-    ),
-
-    "certspotter": (
-        "https://api.certspotter.com/v1/issuances"
-        "?domain={d}&include_subdomains=true&expand=dns_names",
-        certspotter
-    ),
-
-    "hackertarget": (
-        "https://api.hackertarget.com/hostsearch/?q={d}",
-        hackertarget
-    ),
-
-    "urlscan": (
-        "https://urlscan.io/api/v1/search/?q=domain:{d}&size=100",
-        urlscan
-    ),
-
-    "wayback": (
-        "https://web.archive.org/cdx/search/cdx"
-        "?url=*.{d}&output=json&fl=original"
-        "&collapse=urlkey&limit=20000",
-        wayback
-    )
-
+    "crt.sh": ("https://crt.sh/?q=%25.{d}&output=json", crtsh),
+    "certspotter": ("https://api.certspotter.com/v1/issuances?domain={d}&include_subdomains=true&expand=dns_names", certspotter),
+    "hackertarget": ("https://api.hackertarget.com/hostsearch/?q={d}", hackertarget),
+    "urlscan": ("https://urlscan.io/api/v1/search/?q=domain:{d}&size=100", urlscan),
+    "wayback": ("https://web.archive.org/cdx/search/cdx?url=*.{d}&output=json&fl=original&collapse=urlkey&limit=20000", wayback),
 }
 
+# When subfinder is installed these overloaded websites are not needed (subfinder already uses
+# crt.sh, Wayback and many more, and handles their limits). Set USE_WEBSITES=1 to query them anyway.
+if SUBFINDER and os.environ.get("USE_WEBSITES") != "1":
+    SOURCES = {}
 
-# ==========================================
-# DOWNLOAD DATA
-# ==========================================
 
 def download(url):
-
+    """Download a page as text. Tries twice because these free sites are often busy."""
     for attempt in (1, 2):
-
         try:
-
-            request = urllib.request.Request(
-                url,
-                headers={
-                    "User-Agent": "PassiveReconBot/1.0"
-                }
-            )
-
-            with urllib.request.urlopen(
-                request,
-                timeout=20
-            ) as response:
-
-                return response.read(
-                    30 * 1024 * 1024
-                ).decode(
-                    "utf-8",
-                    errors="replace"
-                )
-
+            request = urllib.request.Request(url, headers={"User-Agent": "PassiveReconBot/1.0"})
+            with urllib.request.urlopen(request, timeout=20) as response:
+                return response.read(30 * 1024 * 1024).decode("utf-8", errors="replace")
         except Exception:
-
             if attempt == 2:
                 raise
 
 
+def keep_valid(names, domain):
+    """Keep only clean hostnames that belong to the domain."""
+    found = set()
+    for n in names:
+        n = n.strip().lower().removeprefix("*.")
+        if DOMAIN_RE.match(n) and (n == domain or n.endswith("." + domain)):
+            found.add(n)
+    return found
+
+
 def search_one_source(name, domain):
-
+    """Return the subdomains one website knows about."""
     url, parser = SOURCES[name]
+    return keep_valid(parser(download(url.format(d=domain))), domain)
 
-    response = download(url.format(d=domain))
-
-    return keep_valid(
-        parser(response),
-        domain
-    )
-
-
-# ==========================================
-# OPTIONAL SUBFINDER
-# ==========================================
 
 async def search_subfinder(domain):
-
-    command = [
-        SUBFINDER,
-        "-silent",
-        "-d",
-        domain
-    ]
-
+    """Run the subfinder program. It handles every provider's rate limits and API keys by itself."""
+    command = [SUBFINDER, "-silent", "-d", domain]  # domain was validated, and there is no shell involved
     if SUBFINDER_PROVIDER_CONFIG:
-
-        command.extend([
-            "-pc",
-            SUBFINDER_PROVIDER_CONFIG
-        ])
+        command += ["-pc", SUBFINDER_PROVIDER_CONFIG]
 
     process = await asyncio.create_subprocess_exec(
         *command,
         stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.DEVNULL
+        stderr=asyncio.subprocess.DEVNULL,
     )
-
     try:
-
-        output, _ = await asyncio.wait_for(
-            process.communicate(),
-            timeout=SUBFINDER_TIMEOUT
-        )
-
+        output, _ = await asyncio.wait_for(process.communicate(), SUBFINDER_TIMEOUT)
     except asyncio.TimeoutError:
-
         process.kill()
         await process.wait()
         raise
-
     if process.returncode != 0:
+        raise RuntimeError(f"subfinder exited with code {process.returncode}")
+    return keep_valid(output.decode(errors="replace").splitlines(), domain)
 
-        raise RuntimeError(
-            f"Subfinder exited with code {process.returncode}"
-        )
 
-    return keep_valid(
-        output.decode(errors="replace").splitlines(),
-        domain
+async def gather_subdomains(domain):
+    """Ask all sources at the same time. Returns (subdomains, names of the sources that failed).
+    Each website gets at most 45 seconds, so one slow website cannot block the answer."""
+    names = list(SOURCES)
+    tasks = [asyncio.wait_for(asyncio.to_thread(search_one_source, name, domain), 45) for name in names]
+    if SUBFINDER:
+        names.append("subfinder")
+        tasks.append(search_subfinder(domain))
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    subdomains, failed = set(), []
+    for name, result in zip(names, results):
+        if isinstance(result, Exception):
+            log.warning("%s failed: %r", name, result)
+            failed.append(name)
+        else:
+            subdomains |= result
+    return subdomains, failed
+
+
+# ---------- live check with httpx (ProjectDiscovery, Go): https://github.com/projectdiscovery/httpx ----------
+# NOTE: unlike /subs, this DOES send HTTP requests to the target hosts. Only use it on domains you may test.
+
+HTTPX_STATUS_CODES = "200,403"  # only these status codes count as "live"
+HTTPX_TIMEOUT = 900  # seconds for the whole run (large uploaded lists need longer)
+HTTPX_LINE_RE = re.compile(r"^(https?://\S+)\s+\[(\d{3})\]")
+
+
+def find_httpx():
+    """Find the Go httpx. HTTPX_PATH wins. The Go bin folder is checked too, because `go install` puts it there.
+    (The Python 'httpx' package that the Telegram library uses is a different program.)"""
+    explicit = os.environ.get("HTTPX_PATH")
+    if explicit:
+        return explicit if os.path.isfile(explicit) else None
+    found = shutil.which("httpx")
+    if found:
+        return found
+    go_bin = os.path.join(os.environ.get("GOPATH") or os.path.join(os.path.expanduser("~"), "go"), "bin")
+    candidate = os.path.join(go_bin, "httpx.exe" if os.name == "nt" else "httpx")
+    return candidate if os.path.isfile(candidate) else None
+
+
+HTTPX = find_httpx()
+
+
+async def probe_live(hosts):
+    """Run httpx on the hostnames and return {url: status} for the ones answering 200 or 403."""
+    # Hostnames were validated by keep_valid(); there is no shell and they go in through stdin.
+    command = [HTTPX, "-silent", "-no-color", "-status-code", "-match-code", HTTPX_STATUS_CODES,
+               "-timeout", "10", "-retries", "1", "-rate-limit", "100"]
+    process = await asyncio.create_subprocess_exec(
+        *command,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
     )
+    try:
+        output, _ = await asyncio.wait_for(process.communicate("\n".join(sorted(hosts)).encode()), HTTPX_TIMEOUT)
+    except asyncio.TimeoutError:
+        process.kill()
+        await process.wait()
+        raise
+    if process.returncode != 0:
+        raise RuntimeError(f"httpx exited with code {process.returncode}")
+
+    live = {}
+    for line in output.decode(errors="replace").splitlines():
+        match = HTTPX_LINE_RE.match(line.strip())
+        if match:
+            live[match.group(1)] = match.group(2)
+    return live
 
 
-# ==========================================
-# TELEGRAM MESSAGE RETRIES
-# ==========================================
+# ---------- Telegram commands ----------
 
 async def send(message_function, *args, **kwargs):
-
-    for attempt in (1, 2, 3):
-
+    """Send to Telegram. Retries 5 times with growing waits, because a slow connection often times out.
+    If it still fails, it is logged and the bot keeps running."""
+    for attempt in range(1, 6):
         try:
-
-            return await message_function(
-                *args,
-                **kwargs
-            )
-
-        except NetworkError:
-
-            if attempt == 3:
-                raise
-
-            await asyncio.sleep(2)
+            return await message_function(*args, **kwargs)
+        except NetworkError as error:  # includes TimedOut
+            log.warning("Telegram send failed (try %d/5): %r", attempt, error)
+            await asyncio.sleep(3 * attempt)
+    return None
 
 
-# ==========================================
-# TELEGRAM COMMANDS
-# ==========================================
+async def reply_text_or_file(update: Update, text, filename):
+    if len(text) <= MAX_REPLY_CHARS:
+        await send(update.message.reply_text, f"<pre>{html.escape(text)}</pre>", parse_mode=ParseMode.HTML)
+    else:  # too long for one message, send it as a file
+        await send(update.message.reply_document, document=text.encode(), filename=filename)
 
-async def help_command(update, context):
 
+def parse_domain_argument(context):
+    """Return the validated domain from the command arguments, or None."""
+    if len(context.args) != 1:
+        return None
+    domain = context.args[0].strip().lower().rstrip(".")
+    return domain if DOMAIN_RE.match(domain) else None
+
+
+def hosts_from_text(text):
+    """Pick valid hostnames from an uploaded list. Accepts one host or URL per line, and also the
+    .txt file the bot sends for long /subs results (its header lines are ignored)."""
+    hosts = set()
+    for line in text.splitlines():
+        parts = line.split()
+        if not parts:
+            continue
+        token = parts[0].strip().lower()
+        if "://" in token:
+            token = urllib.parse.urlparse(token).hostname or ""
+        token = token.removeprefix("*.")
+        if DOMAIN_RE.match(token):
+            hosts.add(token)
+    return hosts
+
+
+async def hosts_from_document(document):
+    """Download a Telegram document and return (hosts, error message)."""
+    if document.file_size and document.file_size > MAX_UPLOAD_BYTES:
+        return None, "That file is too big (limit 4 MB)."
+    telegram_file = await document.get_file()
+    data = await telegram_file.download_as_bytearray()
+    hosts = hosts_from_text(bytes(data[:MAX_UPLOAD_BYTES]).decode("utf-8", errors="replace"))
+    if not hosts:
+        return None, "I found no valid hostnames in that file. Use one subdomain per line."
+    if len(hosts) > MAX_UPLOAD_HOSTS:
+        return None, f"Too many hosts (limit {MAX_UPLOAD_HOSTS})."
+    return hosts, None
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Welcome to Passive Subdomain Finder!\n\n"
-        "Usage:\n"
-        "/subs example.com\n\n"
-        "I collect subdomains from public sources."
+        "Send: /subs example.com\nI will list the subdomains found from public sources.\n\n"
+        "Send: /check_live example.com\nI will find the subdomains and list only the URLs that answer "
+        "with status 200 or 403 (checked with httpx).\n\n"
+        "Or upload a .txt file of subdomains (one per line, max 4 MB) with the caption /check_live, "
+        "or reply to a file with /check_live."
     )
 
 
-async def subs_command(update, context):
-
+async def subs_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) != 1:
-
-        await update.message.reply_text(
-            "Usage: /subs example.com"
-        )
-
+        await update.message.reply_text("Usage: /subs example.com")
         return
 
-    domain = (
-        context.args[0]
-        .strip()
-        .lower()
-        .rstrip(".")
-    )
-
-    if not DOMAIN_RE.fullmatch(domain):
-
-        await update.message.reply_text(
-            "Invalid domain. Example: /subs example.com"
-        )
-
+    domain = parse_domain_argument(context)
+    if not domain:
+        await update.message.reply_text("That does not look like a domain. Example: example.com")
         return
 
     async with busy:
+        await send(update.message.reply_text, f"Searching {domain} ...")
+        subdomains, failed = await gather_subdomains(domain)
 
-        await send(
-            update.message.reply_text,
-            f"Searching {domain} ..."
-        )
-
-        names = list(SOURCES.keys())
-
-        tasks = [
-            asyncio.wait_for(
-                asyncio.to_thread(
-                    search_one_source,
-                    name,
-                    domain
-                ),
-                timeout=45
-            )
-            for name in names
-        ]
-
-        if SUBFINDER:
-
-            names.append("subfinder")
-            tasks.append(search_subfinder(domain))
-
-        results = await asyncio.gather(
-            *tasks,
-            return_exceptions=True
-        )
-
-    subdomains = set()
-    failed = []
-
-    for name, result in zip(names, results):
-
-        if isinstance(result, BaseException):
-
-            log.warning("%s failed: %r", name, result)
-            failed.append(name)
-
-        else:
-
-            subdomains |= result
-
-    result_text = (
-        f"{domain}: {len(subdomains)} subdomains found\n"
-    )
-
+    text = f"{domain}: {len(subdomains)} subdomains found\n"
     if failed:
+        text += f"Not working right now: {', '.join(failed)}\n"
+    text += "\n" + "\n".join(sorted(subdomains))
+    await reply_text_or_file(update, text, f"{domain}.txt")
 
-        result_text += (
-            "Not working right now: "
-            + ", ".join(failed)
-            + "\n"
+
+async def check_live_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/check_live example.com, or a file upload with the caption /check_live, or a reply to a file."""
+    if not HTTPX:
+        await update.message.reply_text(
+            "httpx (ProjectDiscovery) is not installed. Install it with:\n"
+            "go install github.com/projectdiscovery/httpx/cmd/httpx@latest\n"
+            "or set HTTPX_PATH to its location."
         )
+        return
 
-    result_text += "\n"
-    result_text += "\n".join(sorted(subdomains))
+    message = update.message
+    document = message.document or (message.reply_to_message.document if message.reply_to_message else None)
+    domain = None if document else parse_domain_argument(context)
 
-    if len(result_text) <= MAX_REPLY_CHARS:
+    if not document and not domain:
+        if context.args:
+            await message.reply_text("That does not look like a domain. Example: example.com")
+        else:
+            await message.reply_text(
+                "Usage: /check_live example.com\n"
+                "Or upload a .txt file of subdomains with the caption /check_live."
+            )
+        return
 
-        await send(
-            update.message.reply_text,
-            f"<pre>{html.escape(result_text)}</pre>",
-            parse_mode=ParseMode.HTML
-        )
+    async with busy:
+        failed = []
+        if document:
+            hosts, error = await hosts_from_document(document)
+            if error:
+                await send(message.reply_text, error)
+                return
+            label, filename = "uploaded list", "uploaded-live.txt"
+            await send(message.reply_text, f"Checking {len(hosts)} hosts from your file ...")
+        else:
+            await send(message.reply_text, f"Finding subdomains of {domain}, then checking which are live ...")
+            hosts, failed = await gather_subdomains(domain)
+            label, filename = domain, f"{domain}-live.txt"
+            if not hosts:
+                await send(message.reply_text, f"{domain}: no subdomains found.")
+                return
+        try:
+            live = await probe_live(hosts)
+        except Exception as error:
+            log.warning("httpx failed: %r", error)
+            await send(message.reply_text, "The live check failed. Try again later.")
+            return
 
+    text = f"{label}: {len(live)} live (status {HTTPX_STATUS_CODES}) out of {len(hosts)} hosts\n"
+    if failed:
+        text += f"Not working right now: {', '.join(failed)}\n"
+    text += "\n" + "\n".join(f"{url} [{code}]" for url, code in sorted(live.items()))
+    await reply_text_or_file(update, text, filename)
+
+
+async def on_error(update, context: ContextTypes.DEFAULT_TYPE):
+    # Network trouble talking to Telegram is temporary. The bot keeps running and retries by itself.
+    if isinstance(context.error, NetworkError):
+        log.warning("Network problem with Telegram (temporary): %r", context.error)
     else:
-
-        await send(
-            update.message.reply_document,
-            document=result_text.encode("utf-8"),
-            filename=f"{domain}.txt"
-        )
+        log.error("Error: %r", context.error)  # one short line instead of a huge traceback
 
 
-# ==========================================
-# ERROR HANDLER
-# ==========================================
+# ---------- health endpoint so Render sees an open port (an external pinger keeps the service awake) ----------
 
-async def on_error(update, context):
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", "2")
+        self.end_headers()
+        self.wfile.write(b"ok")
 
-    log.error(
-        "Telegram error: %r",
-        context.error
-    )
+    def do_HEAD(self):
+        self.send_response(200)
+        self.send_header("Content-Length", "2")
+        self.end_headers()
+
+    def log_message(self, *args):  # keep the logs quiet
+        pass
 
 
-# ==========================================
-# MAIN APPLICATION
-# ==========================================
+def start_health_server():
+    """Serves "ok" on $PORT. Does nothing when PORT is not set (e.g. on your own PC)."""
+    port = os.environ.get("PORT")
+    if not port or not port.isdigit():
+        return
+    # SECURITY EXCEPTION (approved by the bot owner): Render only detects services bound to 0.0.0.0.
+    # The endpoint is read-only, takes no input and returns a fixed 2-byte reply.
+    server = HTTPServer(("0.0.0.0", int(port)), HealthHandler)
+    log.info("Health server listening on port %s", port)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+
 
 def main():
-
+    start_health_server()
     app = (
         Application.builder()
         .token(BOT_TOKEN)
         .concurrent_updates(True)
-
-        .connect_timeout(30)
-        .read_timeout(30)
-        .write_timeout(60)
-        .pool_timeout(30)
-
-        .get_updates_connect_timeout(30)
-        .get_updates_read_timeout(30)
-
-        .post_init(post_init)
-        .post_shutdown(post_shutdown)
-
+        # The default Telegram timeout is about 5 seconds, which is too short on a slow connection.
+        # Sending replies and receiving messages use separate connections, so one cannot stall the other.
+        .connect_timeout(30).read_timeout(30).write_timeout(60).pool_timeout(30)
+        .get_updates_connect_timeout(30).get_updates_read_timeout(30)
+        .get_updates_write_timeout(30).get_updates_pool_timeout(30)
         .build()
     )
-
-    app.add_handler(
-        CommandHandler(
-            ["start", "help"],
-            help_command
-        )
-    )
-
-    app.add_handler(
-        CommandHandler(
-            "subs",
-            subs_command
-        )
-    )
-
+    app.add_handler(CommandHandler(["start", "help"], help_command))
+    app.add_handler(CommandHandler("subs", subs_command))
+    app.add_handler(CommandHandler("check_live", check_live_command))
+    # A file sent with the caption "/check_live" (CommandHandler does not look at captions).
+    app.add_handler(MessageHandler(filters.Document.ALL & filters.CaptionRegex(r"^/check_live(@\w+)?(\s|$)"),
+                                   check_live_command))
     app.add_error_handler(on_error)
-
-    log.info(
-        "Starting bot. Subfinder: %s",
-        SUBFINDER or "not installed"
-    )
-
+    log.info("Bot started. subfinder: %s, httpx: %s", SUBFINDER or "not installed (using websites only)",
+             HTTPX or "not installed (/check_live disabled)")
     app.run_polling()
 
 
