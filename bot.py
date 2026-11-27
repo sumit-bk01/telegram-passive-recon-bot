@@ -211,7 +211,7 @@ async def probe_live(hosts):
     """Run httpx on the hostnames and return {url: status} for the ones answering 200 or 403."""
     # Hostnames were validated by keep_valid(); there is no shell and they go in through stdin.
     command = [HTTPX, "-silent", "-no-color", "-status-code", "-match-code", HTTPX_STATUS_CODES,
-               "-timeout", "10", "-retries", "1", "-rate-limit", "100"]
+               "-timeout", "7", "-retries", "0", "-threads", "100", "-rate-limit", "300"]
     process = await asyncio.create_subprocess_exec(
         *command,
         stdin=asyncio.subprocess.PIPE,
@@ -251,9 +251,9 @@ async def send(message_function, *args, **kwargs):
 
 async def reply_text_or_file(update: Update, text, filename):
     if len(text) <= MAX_REPLY_CHARS:
-        await send(update.message.reply_text, f"<pre>{html.escape(text)}</pre>", parse_mode=ParseMode.HTML)
+        await send(update.effective_message.reply_text, f"<pre>{html.escape(text)}</pre>", parse_mode=ParseMode.HTML)
     else:  # too long for one message, send it as a file
-        await send(update.message.reply_document, document=text.encode(), filename=filename)
+        await send(update.effective_message.reply_document, document=text.encode(), filename=filename)
 
 
 def parse_domain_argument(context):
@@ -296,7 +296,7 @@ async def hosts_from_document(document):
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
+    await update.effective_message.reply_text(
         "Send: /subs example.com\nI will list the subdomains found from public sources.\n\n"
         "Send: /check_live example.com\nI will find the subdomains and list only the URLs that answer "
         "with status 200 or 403 (checked with httpx).\n\n"
@@ -307,16 +307,16 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def subs_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) != 1:
-        await update.message.reply_text("Usage: /subs example.com")
+        await update.effective_message.reply_text("Usage: /subs example.com")
         return
 
     domain = parse_domain_argument(context)
     if not domain:
-        await update.message.reply_text("That does not look like a domain. Example: example.com")
+        await update.effective_message.reply_text("That does not look like a domain. Example: example.com")
         return
 
     async with busy:
-        await send(update.message.reply_text, f"Searching {domain} ...")
+        await send(update.effective_message.reply_text, f"Searching {domain} ...")
         subdomains, failed = await gather_subdomains(domain)
 
     text = f"{domain}: {len(subdomains)} subdomains found\n"
@@ -329,14 +329,14 @@ async def subs_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def check_live_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/check_live example.com, or a file upload with the caption /check_live, or a reply to a file."""
     if not HTTPX:
-        await update.message.reply_text(
+        await update.effective_message.reply_text(
             "httpx (ProjectDiscovery) is not installed. Install it with:\n"
             "go install github.com/projectdiscovery/httpx/cmd/httpx@latest\n"
             "or set HTTPX_PATH to its location."
         )
         return
 
-    message = update.message
+    message = update.effective_message
     document = message.document or (message.reply_to_message.document if message.reply_to_message else None)
     domain = None if document else parse_domain_argument(context)
 
