@@ -20,7 +20,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from telegram import Update
 from telegram.constants import ParseMode
-from telegram.error import NetworkError
+from telegram.error import NetworkError, RetryAfter
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -249,23 +249,59 @@ async def probe_live(hosts, live):
 
 # ---------- Telegram commands ----------
 
+SEND_TRIES = 8
+
+
 async def send(message_function, *args, **kwargs):
-    """Send to Telegram. Retries 5 times with growing waits, because a slow connection often times out.
-    If it still fails, it is logged and the bot keeps running."""
-    for attempt in range(1, 6):
+    """Send to Telegram. Retries up to 8 times with growing waits, because a slow connection often times out.
+    Obeys Telegram's "retry after" (flood limit) answer. If it still fails, it is logged, None is returned
+    and the bot keeps running."""
+    for attempt in range(1, SEND_TRIES + 1):
         try:
             return await message_function(*args, **kwargs)
+        except RetryAfter as error:
+            wait = error.retry_after
+            wait = wait.total_seconds() if hasattr(wait, "total_seconds") else wait
+            log.warning("Telegram asked to wait %s s (try %d/%d)", wait, attempt, SEND_TRIES)
+            await asyncio.sleep(wait + 1)
         except NetworkError as error:  # includes TimedOut
-            log.warning("Telegram send failed (try %d/5): %r", attempt, error)
-            await asyncio.sleep(3 * attempt)
+            log.warning("Telegram send failed (try %d/%d): %r", attempt, SEND_TRIES, error)
+            await asyncio.sleep(min(3 * attempt, 20))
     return None
 
 
+def split_chunks(text, limit=MAX_REPLY_CHARS):
+    """Split text into pieces of at most `limit` characters, breaking only between lines."""
+    chunks, current = [], ""
+    for line in text.splitlines():
+        line = line[:limit]  # a single line can never be longer than a message
+        if current and len(current) + len(line) + 1 > limit:
+            chunks.append(current)
+            current = ""
+        current = f"{current}\n{line}" if current else line
+    if current:
+        chunks.append(current)
+    return chunks
+
+
 async def reply_text_or_file(update: Update, text, filename):
+    message = update.effective_message
     if len(text) <= MAX_REPLY_CHARS:
-        await send(update.effective_message.reply_text, f"<pre>{html.escape(text)}</pre>", parse_mode=ParseMode.HTML)
-    else:  # too long for one message, send it as a file
-        await send(update.effective_message.reply_document, document=text.encode(), filename=filename)
+        await send(message.reply_text, f"<pre>{html.escape(text)}</pre>", parse_mode=ParseMode.HTML)
+        return
+
+    # Too long for one message: send it as a file. Uploads get much longer timeouts than small messages.
+    sent = await send(message.reply_document, document=text.encode(), filename=filename,
+                      read_timeout=180, write_timeout=180, connect_timeout=30, pool_timeout=30)
+    if sent:
+        return
+
+    # The upload kept failing: send the same text as several plain messages (no HTML, so no characters can break it).
+    log.warning("File upload failed, sending the result as text messages instead")
+    for number, chunk in enumerate(split_chunks(text), 1):
+        if not await send(message.reply_text, chunk):
+            log.error("Could not deliver part %d of the result", number)
+            break
 
 
 def parse_domain_argument(context):
