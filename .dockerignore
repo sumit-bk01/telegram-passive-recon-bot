@@ -1,0 +1,4 @@
+.env
+__pycache__/
+*.ps1
+README.md
